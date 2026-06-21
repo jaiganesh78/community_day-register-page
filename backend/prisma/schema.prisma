@@ -1,0 +1,88 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum UserRole {
+  PARTICIPANT
+  ORGANIZER
+  SPEAKER
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum ActivityType {
+  PARTICIPANT_REGISTERED
+  ENTRY_VERIFIED
+  GOODIES_CLAIMED
+  ORGANIZER_LOGIN
+  EMAIL_SENT
+  EMAIL_FAILED
+  QR_RESENT
+  PASSWORD_CHANGED
+  CSV_EXPORTED
+}
+
+model EventConfig {
+  id                 String   @id @default(uuid())
+  eventName          String
+  registrationPrefix String   // e.g. "AWSCD2026"
+  eventDate          DateTime
+  registrationsOpen  Boolean  @default(true)
+  goodiesEnabled     Boolean  @default(true)
+  createdAt          DateTime @default(now())
+}
+
+model User {
+  id                  String        @id @default(uuid())
+  name                String
+  email               String        @unique
+  phone               String
+  passwordHash        String?       // Nullable for participants, required for organizers/speakers
+  role                UserRole      @default(PARTICIPANT)
+  organization        String
+  designation         String
+  city                String
+  avatar              String
+  isActive            Boolean       @default(true)
+  mustChangePassword  Boolean       @default(false)
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  deletedAt           DateTime?     // For Soft Delete Support
+  
+  registration Registration?
+  activityLogs ActivityLog[]
+}
+
+model Registration {
+  id                String      @id @default(uuid())
+  userId            String      @unique
+  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  registrationCode  String      @unique // Format: PREFIX-XXXXXXXX
+  qrToken           String      @unique // Secure cryptographic verification token
+  entryVerified     Boolean     @default(false)
+  entryVerifiedAt   DateTime?
+  goodiesVerified   Boolean     @default(false)
+  goodiesVerifiedAt DateTime?
+  emailStatus       EmailStatus @default(PENDING)
+  emailSentAt       DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+}
+
+model ActivityLog {
+  id        String       @id @default(uuid())
+  userId    String?
+  user      User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    ActivityType
+  metadata  Json?        // Any contextual metadata
+  createdAt DateTime     @default(now())
+}
