@@ -29,6 +29,11 @@ enum ActivityType {
   QR_RESENT
   PASSWORD_CHANGED
   CSV_EXPORTED
+  EMAIL_SENT_SES
+  EMAIL_SENT_GMAIL
+  EMAIL_FAILED_SES
+  EMAIL_FAILED_GMAIL
+  EMAIL_FALLBACK_SUCCESS
 }
 
 model EventConfig {
@@ -74,6 +79,9 @@ model Registration {
   goodiesVerifiedAt DateTime?
   emailStatus       EmailStatus @default(PENDING)
   emailSentAt       DateTime?
+  emailProvider     String?
+  lastEmailAttemptAt DateTime?
+  lastEmailError     String?
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
 }

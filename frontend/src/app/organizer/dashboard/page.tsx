@@ -27,6 +27,9 @@ interface Participant {
     goodiesVerified: boolean;
     goodiesVerifiedAt: string | null;
     emailStatus: string;
+    emailProvider: string | null;
+    lastEmailAttemptAt: string | null;
+    lastEmailError: string | null;
   } | null;
 }
 
@@ -38,9 +41,22 @@ interface DashboardMetrics {
   pendingGoodies: number;
   checkInRate: number;
   goodiesRate: number;
-  emailFailures: number;
+  emailsSentSuccessfully: number;
+  emailsFailed: number;
   emailPending: number;
+  awsSesDeliveries: number;
+  gmailFallbackDeliveries: number;
+  fallbackRate: number;
+  successRate: number;
   todaysRegistrations: number;
+}
+
+interface DashboardHealth {
+  awsStatus: 'ACTIVE' | 'INACTIVE';
+  gmailStatus: 'ACTIVE' | 'INACTIVE';
+  lastSuccessfulEmailTimestamp: string | null;
+  lastFailedEmailTimestamp: string | null;
+  totalFailuresToday: number;
 }
 
 interface ActivityLog {
@@ -59,7 +75,9 @@ export default function OrganizerDashboard() {
 
   // Metrics and Logs states
   const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
+  const [health, setHealth] = useState<DashboardHealth | null>(null);
   const [activities, setActivities] = useState<ActivityLog[]>([]);
+  const [actionRunning, setActionRunning] = useState(false);
   
   // Participant grid states
   const [participants, setParticipants] = useState<Participant[]>([]);
@@ -96,6 +114,7 @@ export default function OrganizerDashboard() {
       }
       const data = await res.json();
       setMetrics(data.metrics);
+      setHealth(data.health);
       setActivities(data.recentActivity);
     } catch (err) {
       console.error("Error loading dashboard data:", err);
@@ -217,6 +236,114 @@ export default function OrganizerDashboard() {
     }
   };
 
+  // Trigger Bulk Resend of Failed Emails
+  const handleResendFailed = async () => {
+    if (!confirm("Are you sure you want to resend all failed emails? This will process in batches of 25 with a 1.5s delay to prevent throttling.")) return;
+    setActionRunning(true);
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000'}/organizer/email/resend-failed`, {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = await res.json();
+      alert(data.message);
+      fetchDashboardData();
+      fetchParticipants();
+    } catch (err: any) {
+      console.error("Error resending failed emails:", err);
+      alert("Failed to trigger bulk resend: " + err.message);
+    } finally {
+      setActionRunning(false);
+    }
+  };
+
+  // Trigger Bulk Retry of Pending Emails
+  const handleRetryPending = async () => {
+    if (!confirm("Are you sure you want to retry all pending emails? This will process in batches of 25 with a 1.5s delay.")) return;
+    setActionRunning(true);
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000'}/organizer/email/retry-pending`, {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = await res.json();
+      alert(data.message);
+      fetchDashboardData();
+      fetchParticipants();
+    } catch (err: any) {
+      console.error("Error retrying pending emails:", err);
+      alert("Failed to trigger pending retry: " + err.message);
+    } finally {
+      setActionRunning(false);
+    }
+  };
+
+  // Export Failed Emails list as CSV
+  const handleExportFailedReport = async () => {
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000'}/organizer/email/export-failed`, {
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error("Export failed");
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `aws-community-day-failed-emails-${new Date().toISOString().split("T")[0]}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Error exporting failed emails:", err);
+      alert("Failed to export failed emails report.");
+    }
+  };
+
+  // Export Delivery Report as CSV
+  const handleExportDeliveryReport = async () => {
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000'}/organizer/email/export-delivery-report`, {
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error("Export failed");
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `aws-community-day-email-delivery-report-${new Date().toISOString().split("T")[0]}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Error exporting delivery report:", err);
+      alert("Failed to export delivery report.");
+    }
+  };
+
+  // Resend single email
+  const handleResendSingleEmail = async (userId: string, userEmail: string) => {
+    if (!confirm(`Are you sure you want to resend the entry pass email to ${userEmail}?`)) return;
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000'}/organizer/participants/${userId}/resend-email`, {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = await res.json();
+      if (res.ok) {
+        alert(data.message || `Email successfully resent to ${userEmail}`);
+        fetchDashboardData();
+        fetchParticipants();
+      } else {
+        alert(data.message || "Failed to resend email.");
+      }
+    } catch (err) {
+      console.error("Error resending email:", err);
+      alert("Error sending email request.");
+    }
+  };
+
   // Trigger Logout
   const handleLogout = async () => {
     try {
@@ -259,6 +386,11 @@ export default function OrganizerDashboard() {
       case "ORGANIZER_LOGIN": return `[${time}] Organizer logged in.`;
       case "EMAIL_SENT": return `[${time}] Pass email sent to ${log.user?.email || "user"}.`;
       case "EMAIL_FAILED": return `[${time}] Pass email failed for ${log.user?.email || "user"}.`;
+      case "EMAIL_SENT_SES": return `[${time}] Pass email sent via AWS SES to ${log.user?.email || "user"}.`;
+      case "EMAIL_SENT_GMAIL": return `[${time}] Pass email sent via Gmail SMTP to ${log.user?.email || "user"}.`;
+      case "EMAIL_FAILED_SES": return `[${time}] AWS SES delivery failed for ${log.user?.email || "user"}.`;
+      case "EMAIL_FAILED_GMAIL": return `[${time}] Gmail SMTP delivery failed for ${log.user?.email || "user"}.`;
+      case "EMAIL_FALLBACK_SUCCESS": return `[${time}] Fallback email triggered successfully for ${log.user?.email || "user"}.`;
       case "QR_RESENT": return `[${time}] Entry QR pass resent to email.`;
       case "PASSWORD_CHANGED": return `[${time}] Security credential changed successfully.`;
       case "CSV_EXPORTED": return `[${time}] Participant database exported to CSV.`;
@@ -322,8 +454,8 @@ export default function OrganizerDashboard() {
               { label: "Total Signups", val: metrics.totalRegistrations, sub: `+${metrics.todaysRegistrations} today`, icon: Users, color: "text-blue-400" },
               { label: "Checked In", val: metrics.checkedIn, sub: `${metrics.checkInRate}% Checked-in`, icon: CheckCircle2, color: "text-cyan-400" },
               { label: "Swags Claimed", val: metrics.goodiesDistributed, sub: `${metrics.goodiesRate}% Claimed`, icon: Gift, color: "text-purple-400" },
-              { label: "Email Sent", val: metrics.totalRegistrations - metrics.emailFailures - metrics.emailPending, sub: `${metrics.emailPending} pending`, icon: Mail, color: "text-green-400" },
-              { label: "Email Failures", val: metrics.emailFailures, sub: "Action required", icon: ShieldAlert, color: "text-red-400", alert: metrics.emailFailures > 0 },
+              { label: "Email Sent", val: metrics.emailsSentSuccessfully, sub: `${metrics.emailPending} pending`, icon: Mail, color: "text-green-400" },
+              { label: "Email Failures", val: metrics.emailsFailed, sub: `${metrics.successRate}% Success Rate`, icon: ShieldAlert, color: "text-red-400", alert: metrics.emailsFailed > 0 },
             ].map((m, i) => {
               const Icon = m.icon;
               return (
@@ -344,26 +476,116 @@ export default function OrganizerDashboard() {
 
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           
-          {/* Recent Activity Panel (Left side in lg layout) */}
-          <section className="lg:col-span-1 glass-panel rounded-2xl border border-cyan-500/10 p-5 space-y-4">
-            <h3 className="text-xs font-black uppercase tracking-wider text-cyan-400">
-              Live Activity Log
-            </h3>
-            <div className="space-y-3.5 max-h-[360px] overflow-y-auto pr-1">
-              {activities.length > 0 ? (
-                activities.map((act) => (
-                  <div key={act.id} className="text-[11px] leading-relaxed border-b border-slate-900/60 pb-2.5 last:border-b-0">
-                    <p className="text-slate-300 font-medium">{formatActivityText(act)}</p>
-                    <p className="text-[9px] text-slate-500 mt-0.5 font-mono">
-                      {new Date(act.createdAt).toLocaleString()}
-                    </p>
+          {/* Left Column: Health, Operations & Activities */}
+          <div className="lg:col-span-1 space-y-6">
+            
+            {/* Email Provider Health Widget */}
+            {health && (
+              <div className="glass-panel p-5 rounded-2xl border border-cyan-500/10 space-y-4">
+                <h3 className="text-xs font-black uppercase tracking-wider text-cyan-400 flex items-center gap-2">
+                  <Cloud size={14} className="animate-pulse" />
+                  Email Provider Health
+                </h3>
+                <div className="space-y-3 text-xs">
+                  <div className="flex justify-between items-center py-1 border-b border-slate-900/60">
+                    <span className="text-slate-400">AWS SES (Primary)</span>
+                    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[10px] font-bold tracking-wider ${
+                      health.awsStatus === 'ACTIVE' 
+                        ? "bg-green-500/10 border-green-500/20 text-green-400" 
+                        : "bg-red-500/10 border-red-500/20 text-red-400"
+                    }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${health.awsStatus === 'ACTIVE' ? "bg-green-400" : "bg-red-400"}`} />
+                      {health.awsStatus === 'ACTIVE' ? "AVAILABLE" : "UNAVAILABLE"}
+                    </span>
                   </div>
-                ))
-              ) : (
-                <p className="text-xs text-slate-600 text-center py-6">No recent actions recorded.</p>
-              )}
-            </div>
-          </section>
+                  <div className="flex justify-between items-center py-1 border-b border-slate-900/60">
+                    <span className="text-slate-400">Gmail SMTP (Fallback)</span>
+                    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-[10px] font-bold tracking-wider ${
+                      health.gmailStatus === 'ACTIVE' 
+                        ? "bg-green-500/10 border-green-500/20 text-green-400" 
+                        : "bg-red-500/10 border-red-500/20 text-red-400"
+                    }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${health.gmailStatus === 'ACTIVE' ? "bg-green-400" : "bg-red-400"}`} />
+                      {health.gmailStatus === 'ACTIVE' ? "AVAILABLE" : "UNAVAILABLE"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-1 border-b border-slate-900/60">
+                    <span className="text-slate-400">Failures Today</span>
+                    <span className={`font-bold ${health.totalFailuresToday > 0 ? "text-red-400" : "text-slate-400"}`}>
+                      {health.totalFailuresToday}
+                    </span>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] text-slate-500">
+                      <span>Last Success:</span>
+                      <span className="font-mono text-slate-400">
+                        {health.lastSuccessfulEmailTimestamp 
+                          ? new Date(health.lastSuccessfulEmailTimestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
+                          : 'Never'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-[10px] text-slate-500">
+                      <span>Last Failure:</span>
+                      <span className="font-mono text-slate-400">
+                        {health.lastFailedEmailTimestamp 
+                          ? new Date(health.lastFailedEmailTimestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
+                          : 'Never'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Email Operations Metrics Widget */}
+            {metrics && (
+              <div className="glass-panel p-5 rounded-2xl border border-cyan-500/10 space-y-4">
+                <h3 className="text-xs font-black uppercase tracking-wider text-cyan-400 flex items-center gap-2">
+                  <Mail size={14} />
+                  Delivery Operations
+                </h3>
+                <div className="space-y-3 text-xs">
+                  <div className="flex justify-between items-center py-1 border-b border-slate-900/60">
+                    <span className="text-slate-400">AWS SES Deliveries</span>
+                    <span className="font-bold text-white font-mono">{metrics.awsSesDeliveries}</span>
+                  </div>
+                  <div className="flex justify-between items-center py-1 border-b border-slate-900/60">
+                    <span className="text-slate-400">Gmail Fallbacks</span>
+                    <span className="font-bold text-cyan-400 font-mono">{metrics.gmailFallbackDeliveries}</span>
+                  </div>
+                  <div className="flex justify-between items-center py-1 border-b border-slate-900/60">
+                    <span className="text-slate-400">Fallback Rate</span>
+                    <span className="font-bold text-yellow-400 font-mono">{metrics.fallbackRate}%</span>
+                  </div>
+                  <div className="flex justify-between items-center py-1 border-b border-slate-900/60">
+                    <span className="text-slate-400">Success Rate</span>
+                    <span className="font-bold text-green-400 font-mono">{metrics.successRate}%</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Recent Activity Panel */}
+            <section className="glass-panel rounded-2xl border border-cyan-500/10 p-5 space-y-4">
+              <h3 className="text-xs font-black uppercase tracking-wider text-cyan-400">
+                Live Activity Log
+              </h3>
+              <div className="space-y-3.5 max-h-[300px] overflow-y-auto pr-1">
+                {activities.length > 0 ? (
+                  activities.map((act) => (
+                    <div key={act.id} className="text-[11px] leading-relaxed border-b border-slate-900/60 pb-2.5 last:border-b-0">
+                      <p className="text-slate-300 font-medium">{formatActivityText(act)}</p>
+                      <p className="text-[9px] text-slate-500 mt-0.5 font-mono">
+                        {new Date(act.createdAt).toLocaleString()}
+                      </p>
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-xs text-slate-600 text-center py-6">No recent actions recorded.</p>
+                )}
+              </div>
+            </section>
+          </div>
 
           {/* Participant Grid panel (Right side in lg layout) */}
           <section className="lg:col-span-3 glass-panel rounded-2xl border border-cyan-500/10 p-5 space-y-5">
@@ -391,6 +613,52 @@ export default function OrganizerDashboard() {
                   </>
                 )}
               </button>
+            </div>
+
+            {/* Bulk Actions Panel */}
+            <div className="glass-panel p-4 rounded-xl border border-cyan-500/10 flex flex-wrap items-center justify-between gap-4 bg-[#020205]/40 backdrop-blur-md">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Bulk Operational Tools:</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleResendFailed}
+                  disabled={actionRunning || !metrics || metrics.emailsFailed === 0}
+                  className="neon-btn-secondary px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider text-red-400 hover:bg-red-500/10 hover:border-red-500/20 disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  {actionRunning ? <Loader2 size={10} className="animate-spin" /> : <AlertTriangle size={10} />}
+                  Resend Failed ({metrics?.emailsFailed || 0})
+                </button>
+                
+                <button
+                  type="button"
+                  onClick={handleRetryPending}
+                  disabled={actionRunning || !metrics || metrics.emailPending === 0}
+                  className="neon-btn-secondary px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider text-yellow-400 hover:bg-yellow-500/10 hover:border-yellow-500/20 disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  {actionRunning ? <Loader2 size={10} className="animate-spin" /> : <Mail size={10} />}
+                  Retry Pending ({metrics?.emailPending || 0})
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleExportFailedReport}
+                  className="neon-btn-secondary px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider text-orange-400 hover:bg-orange-500/10 hover:border-orange-500/20 flex items-center gap-1.5"
+                >
+                  <Download size={10} />
+                  Export Failed CSV
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleExportDeliveryReport}
+                  className="neon-btn-secondary px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider text-green-400 hover:bg-green-500/10 hover:border-green-500/20 flex items-center gap-1.5"
+                >
+                  <Download size={10} />
+                  Delivery Report
+                </button>
+              </div>
             </div>
 
             {/* Filter controls row */}
@@ -434,10 +702,12 @@ export default function OrganizerDashboard() {
                   onChange={(e) => { setEmailFilter(e.target.value); setCurrentPage(1); }}
                   className="bg-slate-950/60 border border-slate-800 focus:border-cyan-500/40 rounded-xl px-2 py-2.5 text-[11px] text-slate-300 outline-none"
                 >
-                  <option value="all">Email Status</option>
-                  <option value="SENT">Sent</option>
-                  <option value="PENDING">Pending</option>
-                  <option value="FAILED">Failed</option>
+                  <option value="all">All Email Status</option>
+                  <option value="SENT">Sent Successfully</option>
+                  <option value="PENDING">Pending Delivery</option>
+                  <option value="FAILED">Failed Delivery</option>
+                  <option value="AWS_SES">AWS SES Primary</option>
+                  <option value="GMAIL_FALLBACK">Gmail Fallback</option>
                 </select>
               </div>
             </form>
@@ -519,19 +789,45 @@ export default function OrganizerDashboard() {
                             )}
                           </td>
                           <td className="p-4 text-center">
-                            <span className={`inline-flex px-2.5 py-1.5 rounded-full border text-[9px] font-bold uppercase tracking-wider ${getEmailBadgeColor(reg?.emailStatus || "PENDING")}`}>
-                              {reg?.emailStatus || "PENDING"}
-                            </span>
+                            <div className="flex flex-col items-center gap-1">
+                              <span className={`inline-flex px-2 py-0.5 rounded-full border text-[9px] font-bold uppercase tracking-wider ${getEmailBadgeColor(reg?.emailStatus || "PENDING")}`}>
+                                {reg?.emailStatus || "PENDING"}
+                              </span>
+                              {reg?.emailProvider && (
+                                <span className="text-[8px] font-black text-cyan-400 font-mono tracking-wider">
+                                  {reg.emailProvider === 'AWS_SES' ? 'AWS SES' : 'GMAIL FALLBACK'}
+                                </span>
+                              )}
+                              {reg?.lastEmailAttemptAt && (
+                                <span className="text-[8px] text-slate-500" title={`Last Attempt: ${new Date(reg.lastEmailAttemptAt).toLocaleString()}`}>
+                                  {new Date(reg.lastEmailAttemptAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </span>
+                              )}
+                              {reg?.emailStatus === 'FAILED' && reg?.lastEmailError && (
+                                <div className="text-[8px] text-red-400 max-w-[120px] truncate hover:text-clip hover:whitespace-normal font-mono bg-red-950/20 border border-red-500/10 px-1 py-0.5 rounded" title={reg.lastEmailError}>
+                                  {reg.lastEmailError}
+                                </div>
+                              )}
+                            </div>
                           </td>
-                          <td className="p-4 text-right">
-                            <button
-                              onClick={() => handleDeleteParticipant(p.id)}
-                              disabled={deletingId === p.id}
-                              className="p-2 text-slate-500 hover:text-red-400 transition-colors bg-slate-950 rounded-lg border border-slate-900 hover:border-red-500/20 disabled:opacity-50"
-                              title="Soft delete participant"
-                            >
-                              <Trash2 size={13} />
-                            </button>
+                          <td className="p-4">
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                onClick={() => handleResendSingleEmail(p.id, p.email)}
+                                className="p-2 text-slate-400 hover:text-cyan-400 transition-colors bg-slate-950 rounded-lg border border-slate-900 hover:border-cyan-500/20"
+                                title="Resend Entry QR Code Email"
+                              >
+                                <Mail size={13} />
+                              </button>
+                              <button
+                                onClick={() => handleDeleteParticipant(p.id)}
+                                disabled={deletingId === p.id}
+                                className="p-2 text-slate-500 hover:text-red-400 transition-colors bg-slate-950 rounded-lg border border-slate-900 hover:border-red-500/20 disabled:opacity-50"
+                                title="Soft delete participant"
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );

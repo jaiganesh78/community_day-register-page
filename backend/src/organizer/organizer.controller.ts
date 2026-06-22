@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Delete, Body, Query, UseGuards, Req, Res, Param, HttpStatus, HttpCode } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Body, Query, UseGuards, Req, Res, Param, HttpStatus, HttpCode, BadRequestException } from '@nestjs/common';
 import type { Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
 import { AttendanceService } from './attendance.service';
@@ -9,6 +9,8 @@ import { Roles } from '../auth/decorators/roles.decorator';
 import { UserRole, EmailStatus, ActivityType, Prisma } from '@prisma/client';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { ActivityLogService } from '../activity-log/activity-log.service';
+import { QrService } from '../qr/qr.service';
+import { EmailService } from '../email/email.service';
 
 @ApiTags('Organizer Tools')
 @ApiBearerAuth()
@@ -20,6 +22,8 @@ export class OrganizerController {
     private prisma: PrismaService,
     private attendanceService: AttendanceService,
     private activityLogService: ActivityLogService,
+    private qrService: QrService,
+    private emailService: EmailService,
   ) {}
 
   @Get('dashboard')
@@ -44,7 +48,12 @@ export class OrganizerController {
     const checkInRate = totalRegistrations > 0 ? Math.round((checkedIn / totalRegistrations) * 100) : 0;
     const goodiesRate = totalRegistrations > 0 ? Math.round((goodiesDistributed / totalRegistrations) * 100) : 0;
 
-    const emailFailures = await this.prisma.registration.count({
+    // Detailed email operational metrics
+    const emailsSentSuccessfully = await this.prisma.registration.count({
+      where: { emailStatus: EmailStatus.SENT, user: { deletedAt: null } },
+    });
+
+    const emailsFailed = await this.prisma.registration.count({
       where: { emailStatus: EmailStatus.FAILED, user: { deletedAt: null } },
     });
 
@@ -52,9 +61,43 @@ export class OrganizerController {
       where: { emailStatus: EmailStatus.PENDING, user: { deletedAt: null } },
     });
 
-    // Today's registrations count
+    const awsSesDeliveries = await this.prisma.registration.count({
+      where: { emailProvider: 'AWS_SES', user: { deletedAt: null } },
+    });
+
+    const gmailFallbackDeliveries = await this.prisma.registration.count({
+      where: { emailProvider: 'GMAIL_FALLBACK', user: { deletedAt: null } },
+    });
+
+    const totalSent = awsSesDeliveries + gmailFallbackDeliveries;
+    const fallbackRate = totalSent > 0 ? Math.round((gmailFallbackDeliveries / totalSent) * 100) : 0;
+    const successRate = totalRegistrations > 0 ? Math.round((emailsSentSuccessfully / totalRegistrations) * 100) : 0;
+
+    // Health Widget active timestamps and today's metrics
+    const lastSuccessRecord = await this.prisma.registration.findFirst({
+      where: { emailStatus: EmailStatus.SENT, user: { deletedAt: null } },
+      orderBy: { emailSentAt: 'desc' },
+      select: { emailSentAt: true },
+    });
+
+    const lastFailedRecord = await this.prisma.registration.findFirst({
+      where: { emailStatus: EmailStatus.FAILED, user: { deletedAt: null } },
+      orderBy: { lastEmailAttemptAt: 'desc' },
+      select: { lastEmailAttemptAt: true },
+    });
+
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
+
+    const totalFailuresToday = await this.prisma.registration.count({
+      where: {
+        emailStatus: EmailStatus.FAILED,
+        lastEmailAttemptAt: { gte: startOfToday },
+        user: { deletedAt: null },
+      },
+    });
+
+    // Today's registrations count
     const todaysRegistrations = await this.prisma.user.count({
       where: {
         role: UserRole.PARTICIPANT,
@@ -86,9 +129,21 @@ export class OrganizerController {
         pendingGoodies,
         checkInRate,
         goodiesRate,
-        emailFailures,
+        emailsSentSuccessfully,
+        emailsFailed,
         emailPending,
+        awsSesDeliveries,
+        gmailFallbackDeliveries,
+        fallbackRate,
+        successRate,
         todaysRegistrations,
+      },
+      health: {
+        awsStatus: this.emailService.isAwsConfigured() ? 'ACTIVE' : 'INACTIVE',
+        gmailStatus: this.emailService.isGmailConfigured() ? 'ACTIVE' : 'INACTIVE',
+        lastSuccessfulEmailTimestamp: lastSuccessRecord?.emailSentAt || null,
+        lastFailedEmailTimestamp: lastFailedRecord?.lastEmailAttemptAt || null,
+        totalFailuresToday,
       },
       recentActivity,
     };
@@ -100,7 +155,7 @@ export class OrganizerController {
     @Query('search') search?: string,
     @Query('entryStatus') entryStatus?: 'checked-in' | 'pending',
     @Query('goodiesStatus') goodiesStatus?: 'claimed' | 'pending',
-    @Query('emailStatus') emailStatus?: EmailStatus,
+    @Query('emailStatus') emailStatus?: string,
     @Query('page') page = '1',
     @Query('limit') limit = '20',
     @Query('sortBy') sortBy = 'createdAt',
@@ -165,6 +220,212 @@ export class OrganizerController {
     };
   }
 
+  @Post('participants/:id/resend-email')
+  @ApiOperation({ summary: 'Resend registration email for a single participant' })
+  async resendSingleEmail(@Param('id') userId: string) {
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId, deletedAt: null },
+      include: { registration: true },
+    });
+
+    if (!user || !user.registration) {
+      throw new BadRequestException('Participant registration not found.');
+    }
+
+    const reg = user.registration;
+    const qrBuffer = await this.qrService.generateQrCodeBuffer(reg.registrationCode);
+
+    try {
+      await this.emailService.sendRegistrationEmail(
+        user.id,
+        user.name,
+        user.email,
+        reg.registrationCode,
+        qrBuffer,
+      );
+
+      await this.activityLogService.log(
+        ActivityType.QR_RESENT,
+        user.id,
+        { email: user.email, registrationCode: reg.registrationCode, triggeredBy: 'ORGANIZER' },
+      );
+
+      return {
+        message: `Registration email successfully resent to ${user.email}`,
+      };
+    } catch (error: any) {
+      throw new BadRequestException(`Failed to resend email: ${error.message}`);
+    }
+  }
+
+  @Post('email/resend-failed')
+  @ApiOperation({ summary: 'Resend all failed emails in batches of 25' })
+  async resendFailedEmails() {
+    const failedRegs = await this.prisma.registration.findMany({
+      where: {
+        emailStatus: EmailStatus.FAILED,
+        user: { deletedAt: null },
+      },
+      include: { user: true },
+    });
+
+    if (failedRegs.length === 0) {
+      return { message: 'No failed registration emails to resend.' };
+    }
+
+    // Trigger async processing in background to prevent client timeout
+    this.processBulkResends(failedRegs, 'RESEND_FAILED');
+
+    return {
+      message: `Triggered batch resend for ${failedRegs.length} failed emails. Processing in batches of 25. Check logs for progress.`,
+      count: failedRegs.length,
+    };
+  }
+
+  @Post('email/retry-pending')
+  @ApiOperation({ summary: 'Retry all pending emails in batches of 25' })
+  async retryPendingEmails() {
+    const pendingRegs = await this.prisma.registration.findMany({
+      where: {
+        emailStatus: EmailStatus.PENDING,
+        user: { deletedAt: null },
+      },
+      include: { user: true },
+    });
+
+    if (pendingRegs.length === 0) {
+      return { message: 'No pending registration emails to retry.' };
+    }
+
+    this.processBulkResends(pendingRegs, 'RETRY_PENDING');
+
+    return {
+      message: `Triggered batch retry for ${pendingRegs.length} pending emails. Processing in batches of 25. Check logs for progress.`,
+      count: pendingRegs.length,
+    };
+  }
+
+  @Get('email/export-failed')
+  @ApiOperation({ summary: 'Export failed email list as CSV' })
+  async exportFailedEmails(@Res() res: Response) {
+    const failedList = await this.prisma.registration.findMany({
+      where: {
+        emailStatus: EmailStatus.FAILED,
+        user: { deletedAt: null },
+      },
+      include: { user: true },
+    });
+
+    const headers = ['Name', 'Email', 'Phone', 'Registration Code', 'Last Attempt At', 'Last Error'];
+    const rows = failedList.map((reg) => [
+      reg.user.name,
+      reg.user.email,
+      reg.user.phone,
+      reg.registrationCode,
+      reg.lastEmailAttemptAt ? reg.lastEmailAttemptAt.toISOString() : 'N/A',
+      reg.lastEmailError || 'N/A',
+    ]);
+
+    const csvContent = [
+      headers.join(','),
+      ...rows.map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')),
+    ].join('\n');
+
+    res.header('Content-Type', 'text/csv');
+    res.attachment('aws-community-day-failed-emails.csv');
+    return res.status(HttpStatus.OK).send(csvContent);
+  }
+
+  @Get('email/export-delivery-report')
+  @ApiOperation({ summary: 'Export email delivery report as CSV' })
+  async exportDeliveryReport(@Res() res: Response) {
+    const totalRegistrations = await this.prisma.user.count({
+      where: { role: UserRole.PARTICIPANT, deletedAt: null },
+    });
+    const sentCount = await this.prisma.registration.count({
+      where: { emailStatus: EmailStatus.SENT, user: { deletedAt: null } },
+    });
+    const failedCount = await this.prisma.registration.count({
+      where: { emailStatus: EmailStatus.FAILED, user: { deletedAt: null } },
+    });
+    const pendingCount = await this.prisma.registration.count({
+      where: { emailStatus: EmailStatus.PENDING, user: { deletedAt: null } },
+    });
+    const awsCount = await this.prisma.registration.count({
+      where: { emailProvider: 'AWS_SES', user: { deletedAt: null } },
+    });
+    const gmailCount = await this.prisma.registration.count({
+      where: { emailProvider: 'GMAIL_FALLBACK', user: { deletedAt: null } },
+    });
+
+    const fallbackRate = (awsCount + gmailCount) > 0 ? Math.round((gmailCount / (awsCount + gmailCount)) * 100) : 0;
+    const successRate = totalRegistrations > 0 ? Math.round((sentCount / totalRegistrations) * 100) : 0;
+
+    const headers = ['Metric', 'Value'];
+    const rows = [
+      ['Total Registrations', totalRegistrations],
+      ['Emails Sent Successfully', sentCount],
+      ['Emails Failed', failedCount],
+      ['Emails Pending', pendingCount],
+      ['AWS SES Deliveries', awsCount],
+      ['Gmail Fallback Deliveries', gmailCount],
+      ['Fallback Rate %', `${fallbackRate}%`],
+      ['Email Success Rate %', `${successRate}%`],
+      ['AWS SES Provider Status', this.emailService.isAwsConfigured() ? 'AVAILABLE' : 'UNAVAILABLE'],
+      ['Gmail SMTP Provider Status', this.emailService.isGmailConfigured() ? 'AVAILABLE' : 'UNAVAILABLE'],
+      ['Report Generated At', new Date().toISOString()],
+    ];
+
+    const csvContent = [
+      headers.join(','),
+      ...rows.map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')),
+    ].join('\n');
+
+    res.header('Content-Type', 'text/csv');
+    res.attachment('aws-community-day-email-delivery-report.csv');
+    return res.status(HttpStatus.OK).send(csvContent);
+  }
+
+  private async processBulkResends(registrations: any[], operationType: string) {
+    const batchSize = 25;
+    const delayMs = 1500;
+    const total = registrations.length;
+    console.log(`[EMAIL] [BULK] [START] Initiating operational bulk emails: type=${operationType}, count=${total}`);
+
+    for (let i = 0; i < total; i += batchSize) {
+      const batch = registrations.slice(i, i + batchSize);
+      const batchIndex = Math.floor(i / batchSize) + 1;
+      const totalBatches = Math.ceil(total / batchSize);
+      console.log(`[EMAIL] [BULK] [PROCESSING] Batch ${batchIndex}/${totalBatches} (${batch.length} emails)`);
+
+      const batchPromises = batch.map(async (reg) => {
+        try {
+          // Existing QR remains the source of truth, generate matching buffer
+          const qrBuffer = await this.qrService.generateQrCodeBuffer(reg.registrationCode);
+          await this.emailService.sendRegistrationEmail(
+            reg.user.id,
+            reg.user.name,
+            reg.user.email,
+            reg.registrationCode,
+            qrBuffer,
+          );
+        } catch (error: any) {
+          console.error(`[EMAIL] [BULK] [ERROR] Failed processing email resend for ${reg.user.email}: ${error.message}`);
+        }
+      });
+
+      await Promise.all(batchPromises);
+
+      // Throttling protection delay
+      if (i + batchSize < total) {
+        console.log(`[EMAIL] [BULK] [THROTTLE] Waiting ${delayMs / 1000} seconds before next batch...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+
+    console.log(`[EMAIL] [BULK] [END] Completed bulk email operation: type=${operationType}`);
+  }
+
   @Get('participants/export')
   @ApiOperation({ summary: 'Export filtered list as CSV' })
   async exportParticipants(
@@ -173,7 +434,7 @@ export class OrganizerController {
     @Query('search') search?: string,
     @Query('entryStatus') entryStatus?: 'checked-in' | 'pending',
     @Query('goodiesStatus') goodiesStatus?: 'claimed' | 'pending',
-    @Query('emailStatus') emailStatus?: EmailStatus,
+    @Query('emailStatus') emailStatus?: string,
     @Query('sortBy') sortBy = 'createdAt',
     @Query('sortOrder') sortOrder: 'asc' | 'desc' = 'desc',
   ) {
@@ -214,6 +475,9 @@ export class OrganizerController {
       'Goodies Status',
       'Goodies Timestamp',
       'Email Status',
+      'Email Provider',
+      'Last Email Attempt',
+      'Last Email Error',
       'Created Date',
     ];
 
@@ -238,6 +502,9 @@ export class OrganizerController {
         reg?.goodiesVerified ? 'Claimed' : 'Pending',
         reg?.goodiesVerifiedAt ? reg.goodiesVerifiedAt.toISOString() : 'N/A',
         escapeCsv(reg?.emailStatus),
+        escapeCsv(reg?.emailProvider || 'N/A'),
+        reg?.lastEmailAttemptAt ? reg.lastEmailAttemptAt.toISOString() : 'N/A',
+        escapeCsv(reg?.lastEmailError || 'None'),
         p.createdAt.toISOString(),
       ];
     });
@@ -268,7 +535,7 @@ export class OrganizerController {
     search?: string,
     entryStatus?: 'checked-in' | 'pending',
     goodiesStatus?: 'claimed' | 'pending',
-    emailStatus?: EmailStatus,
+    emailStatus?: string,
   ): Prisma.UserWhereInput {
     const where: Prisma.UserWhereInput = {
       role: UserRole.PARTICIPANT,
@@ -310,13 +577,21 @@ export class OrganizerController {
       });
     }
 
-    // Filter by emailStatus
-    if (emailStatus) {
-      andConditions.push({
-        registration: {
-          emailStatus,
-        },
-      });
+    // Filter by emailStatus (includes provider specific status overrides)
+    if (emailStatus && emailStatus !== 'all') {
+      if (emailStatus === 'AWS_SES' || emailStatus === 'GMAIL_FALLBACK') {
+        andConditions.push({
+          registration: {
+            emailProvider: emailStatus,
+          },
+        });
+      } else {
+        andConditions.push({
+          registration: {
+            emailStatus: emailStatus as EmailStatus,
+          },
+        });
+      }
     }
 
     if (andConditions.length > 0) {

@@ -102,45 +102,18 @@ export class RegistrationService {
     const qrBuffer = await this.qrService.generateQrCodeBuffer(registrationCode);
     const qrDataUrl = await this.qrService.generateQrCodeDataUrl(registrationCode);
 
-    // 7. Dispatch Email
+    // 7. Dispatch Email automatically immediately after registration
     try {
       await this.emailService.sendRegistrationEmail(
+        result.user.id,
         result.user.name,
         result.user.email,
         registrationCode,
         qrBuffer,
       );
-
-      // Update email status to SENT
-      await this.prisma.registration.update({
-        where: { id: result.registration.id },
-        data: {
-          emailStatus: EmailStatus.SENT,
-          emailSentAt: new Date(),
-        },
-      });
-
-      await this.activityLogService.log(
-        ActivityType.EMAIL_SENT,
-        result.user.id,
-        { email: result.user.email, registrationCode },
-      );
     } catch (error) {
-      console.error('[RegistrationService] Email dispatch failed:', error);
-
-      // Update email status to FAILED
-      await this.prisma.registration.update({
-        where: { id: result.registration.id },
-        data: {
-          emailStatus: EmailStatus.FAILED,
-        },
-      });
-
-      await this.activityLogService.log(
-        ActivityType.EMAIL_FAILED,
-        result.user.id,
-        { email: result.user.email, error: error.message },
-      );
+      console.error('[RegistrationService] Initial registration email dispatch failed:', error);
+      // Registration remains committed; delivery status is tracked inside EmailService
     }
 
     return {
@@ -199,19 +172,12 @@ export class RegistrationService {
 
     try {
       await this.emailService.sendRegistrationEmail(
+        user.id,
         user.name,
         user.email,
         reg.registrationCode,
         qrBuffer,
       );
-
-      await this.prisma.registration.update({
-        where: { id: reg.id },
-        data: {
-          emailStatus: EmailStatus.SENT,
-          emailSentAt: new Date(),
-        },
-      });
 
       await this.activityLogService.log(
         ActivityType.QR_RESENT,
@@ -219,32 +185,12 @@ export class RegistrationService {
         { email: user.email, registrationCode: reg.registrationCode },
       );
 
-      await this.activityLogService.log(
-        ActivityType.EMAIL_SENT,
-        user.id,
-        { email: user.email, registrationCode: reg.registrationCode, type: 'RESEND' },
-      );
-
       return {
         message: 'Registration QR code has been resent to your email address.',
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('[RegistrationService] QR Resend email failed:', error);
-
-      await this.prisma.registration.update({
-        where: { id: reg.id },
-        data: {
-          emailStatus: EmailStatus.FAILED,
-        },
-      });
-
-      await this.activityLogService.log(
-        ActivityType.EMAIL_FAILED,
-        user.id,
-        { email: user.email, error: error.message, type: 'RESEND' },
-      );
-
-      throw new BadRequestException('Failed to send QR code email. Please contact support.');
+      throw new BadRequestException(`Failed to send QR code email: ${error.message}`);
     }
   }
 

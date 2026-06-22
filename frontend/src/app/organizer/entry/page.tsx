@@ -32,16 +32,38 @@ export default function EntryScanner() {
     startScanner();
 
     return () => {
-      stopScanner();
+      stopAndCleanupScanner();
     };
   }, []);
+
+  const stopAndCleanupScanner = async () => {
+    if (qrReaderRef.current) {
+      try {
+        if (qrReaderRef.current.isScanning) {
+          await qrReaderRef.current.stop();
+        }
+      } catch (err) {
+        console.warn("Error stopping scanner on cleanup:", err);
+      }
+      try {
+        qrReaderRef.current.clear();
+      } catch (err) {
+        console.warn("Error clearing scanner on cleanup:", err);
+      }
+      qrReaderRef.current = null;
+    }
+    setScanning(false);
+  };
 
   const startScanner = async () => {
     setCameraError("");
     setScanResult(null);
     setScanning(true);
 
-    // Give the DOM a moment to mount the element
+    // Stop and clear any existing instances first
+    await stopAndCleanupScanner();
+
+    // Small tick to let state propagate
     setTimeout(async () => {
       try {
         const qrScanner = new Html5Qrcode(readerId);
@@ -53,7 +75,6 @@ export default function EntryScanner() {
           { facingMode: "environment" },
           config,
           async (decodedText) => {
-            // Success callback: QR code scanned
             await handleQrDecoded(decodedText);
           },
           (errorMessage) => {
@@ -65,23 +86,12 @@ export default function EntryScanner() {
         setCameraError("Camera access denied or device is already in use by another panel.");
         setScanning(false);
       }
-    }, 100);
-  };
-
-  const stopScanner = async () => {
-    if (qrReaderRef.current && qrReaderRef.current.isScanning) {
-      try {
-        await qrReaderRef.current.stop();
-      } catch (err) {
-        console.error("Error stopping scanner:", err);
-      }
-    }
-    setScanning(false);
+    }, 50);
   };
 
   const handleQrDecoded = async (decodedText: string) => {
     // Stop scanning once we get a payload
-    await stopScanner();
+    await stopAndCleanupScanner();
     setLoading(true);
 
     try {
@@ -167,6 +177,48 @@ export default function EntryScanner() {
         {/* Scan / Alert Container */}
         <div className="w-full glass-panel rounded-3xl border border-cyan-500/15 p-6 shadow-[0_0_40px_rgba(0,240,255,0.05)] aspect-square flex flex-col items-center justify-center relative overflow-hidden">
           
+          {/* Active Scanning Feed - Always in DOM to prevent React mount race conditions */}
+          <div 
+            className={`w-full h-full flex flex-col justify-between items-center relative ${scanResult ? 'hidden' : 'flex'}`}
+          >
+            {/* Camera viewport wrapper */}
+            <div className="w-full flex-grow relative bg-black/60 rounded-2xl border border-slate-900 overflow-hidden flex items-center justify-center">
+              <div id={readerId} className="w-full h-full object-cover"></div>
+              
+              {!scanning && !cameraError && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center space-y-2 text-slate-500">
+                  <Camera size={24} />
+                  <p className="text-[10px] uppercase font-bold tracking-widest">Initialising lens...</p>
+                </div>
+              )}
+
+              {cameraError && (
+                <div className="absolute inset-0 p-6 flex flex-col items-center justify-center text-center space-y-3 z-10 bg-black/90">
+                  <XCircle className="text-red-400" size={28} />
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-red-400">Camera Hook Failed</h4>
+                  <p className="text-[10px] text-slate-400 leading-relaxed">{cameraError}</p>
+                  <button
+                    onClick={startScanner}
+                    className="neon-btn-secondary px-4 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider"
+                  >
+                    Try Again
+                  </button>
+                </div>
+              )}
+
+              {scanning && (
+                <div className="absolute inset-0 pointer-events-none border-[3px] border-dashed border-cyan-500/20 rounded-2xl animate-pulse flex items-center justify-center">
+                  {/* Laser scanner guide line */}
+                  <div className="w-4/5 h-[1.5px] bg-cyan-400 shadow-[0_0_10px_#00f0ff] animate-[y-scan_2s_infinite_linear]" />
+                </div>
+              )}
+            </div>
+
+            <p className="text-[10px] text-slate-500 text-center font-semibold tracking-wider mt-4">
+              POSITION TICKET QR IN TARGET BOX
+            </p>
+          </div>
+
           <AnimatePresence mode="wait">
             {loading && (
               <motion.div
@@ -183,7 +235,7 @@ export default function EntryScanner() {
               </motion.div>
             )}
 
-            {scanResult ? (
+            {scanResult && (
               /* Verification Results Screen */
               <motion.div
                 key="result"
@@ -243,52 +295,6 @@ export default function EntryScanner() {
                   <RefreshCw size={12} />
                   Scan Next Ticket
                 </button>
-              </motion.div>
-            ) : (
-              /* Active Scanning Feed */
-              <motion.div
-                key="scanner"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="w-full h-full flex flex-col justify-between items-center relative"
-              >
-                {/* Camera viewport wrapper */}
-                <div className="w-full flex-grow relative bg-black/60 rounded-2xl border border-slate-900 overflow-hidden flex items-center justify-center">
-                  <div id={readerId} className="w-full h-full object-cover"></div>
-                  
-                  {!scanning && !cameraError && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center space-y-2 text-slate-500">
-                      <Camera size={24} />
-                      <p className="text-[10px] uppercase font-bold tracking-widest">Initialising lens...</p>
-                    </div>
-                  )}
-
-                  {cameraError && (
-                    <div className="absolute inset-0 p-6 flex flex-col items-center justify-center text-center space-y-3 z-10 bg-black/90">
-                      <XCircle className="text-red-400" size={28} />
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-red-400">Camera Hook Failed</h4>
-                      <p className="text-[10px] text-slate-400 leading-relaxed">{cameraError}</p>
-                      <button
-                        onClick={startScanner}
-                        className="neon-btn-secondary px-4 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider"
-                      >
-                        Try Again
-                      </button>
-                    </div>
-                  )}
-
-                  {scanning && (
-                    <div className="absolute inset-0 pointer-events-none border-[3px] border-dashed border-cyan-500/20 rounded-2xl animate-pulse flex items-center justify-center">
-                      {/* Laser scanner guide line */}
-                      <div className="w-4/5 h-[1.5px] bg-cyan-400 shadow-[0_0_10px_#00f0ff] animate-[y-scan_2s_infinite_linear]" />
-                    </div>
-                  )}
-                </div>
-
-                <p className="text-[10px] text-slate-500 text-center font-semibold tracking-wider mt-4">
-                  POSITION TICKET QR IN TARGET BOX
-                </p>
               </motion.div>
             )}
           </AnimatePresence>

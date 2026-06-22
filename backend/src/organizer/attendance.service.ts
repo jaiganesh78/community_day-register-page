@@ -55,14 +55,34 @@ export class AttendanceService {
         };
       }
 
-      // Mark Checked In
-      await this.prisma.registration.update({
-        where: { id: registration.id },
+      // Mark Checked In Atomically to prevent concurrent scan race conditions
+      const updated = await this.prisma.registration.updateMany({
+        where: {
+          id: registration.id,
+          entryVerified: false,
+        },
         data: {
           entryVerified: true,
           entryVerifiedAt: now,
         },
       });
+
+      if (updated.count === 0) {
+        // Concurrent verification detected, return already verified status
+        const reFetched = await this.prisma.registration.findUnique({
+          where: { id: registration.id },
+        });
+        return {
+          status: 'ALREADY_VERIFIED',
+          message: 'This ticket has already been verified.',
+          verifiedAt: reFetched?.entryVerifiedAt || now,
+          participant: {
+            name: user.name,
+            email: user.email,
+            organization: user.organization,
+          },
+        };
+      }
 
       await this.activityLogService.log(
         ActivityType.ENTRY_VERIFIED,
@@ -100,14 +120,34 @@ export class AttendanceService {
         };
       }
 
-      // Mark Goodies Claimed
-      await this.prisma.registration.update({
-        where: { id: registration.id },
+      // Mark Goodies Claimed Atomically to prevent concurrent scan race conditions
+      const updated = await this.prisma.registration.updateMany({
+        where: {
+          id: registration.id,
+          goodiesVerified: false,
+        },
         data: {
           goodiesVerified: true,
           goodiesVerifiedAt: now,
         },
       });
+
+      if (updated.count === 0) {
+        // Concurrent goodies claim detected, return already claimed status
+        const reFetched = await this.prisma.registration.findUnique({
+          where: { id: registration.id },
+        });
+        return {
+          status: 'ALREADY_CLAIMED',
+          message: 'Goodies for this ticket have already been claimed.',
+          verifiedAt: reFetched?.goodiesVerifiedAt || now,
+          participant: {
+            name: user.name,
+            email: user.email,
+            organization: user.organization,
+          },
+        };
+      }
 
       await this.activityLogService.log(
         ActivityType.GOODIES_CLAIMED,
